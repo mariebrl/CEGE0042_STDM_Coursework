@@ -1,0 +1,765 @@
+---
+title: Analysis of the impact of car accidents on traffic in the state of New York
+  between 2016 and 2021
+output:
+  html_document: 
+    toc: yes
+  pdf_document: default
+date: "2023-03-29"
+---
+
+# Analysis of the impact of car accidents on traffic in the state of New York between 2016 and 2021
+
+## Import libraries
+
+```{r }
+# Import libraries / Install packages if necessary
+library("ggplot2")
+library("plotly")
+library("ggthemes")
+library("tidyverse")
+library("lubridate")
+library("dplyr")
+library("spData")
+library("sf")
+library("sp")
+library("mapsf")
+library("corrplot") 
+library("raster")
+library("rgdal")
+library("tmap")
+library("FactoMineR")
+library("spdep")
+library("spacetime")
+library("rpart")
+library("ada")
+
+source("data/map_plot.R")
+source("data/starima_package.R")
+
+```
+
+## Import Datasets
+
+```{r }
+## US car accidents
+car_accidents_import <- read.csv("data/US_Accidents_Dec21_updated.csv")
+colname <- names(car_accidents_import)
+
+## Select accidents from one city: NY
+car_accidents <- car_accidents_import[car_accidents_import$County %in% c("Bronx", "New York", "Queens", "Kings"),]
+summary(car_accidents)
+
+## city coordinates // https://data.cityofnewyork.us/Business/Zip-Code-Boundaries/i8iw-xf4u/data?no_mobile=true
+city_boundaries <- st_read(dsn="Data/ZIP_CODE_040114.shp")
+city_boundaries <- city_boundaries[, c("ZIPCODE", "COUNTY", "geometry")]
+
+```
+
+## Data Preparation
+
+```{r}
+colnames(car_accidents)
+str(car_accidents)
+```
+
+### Check if missing values or empty cells
+
+```{r}
+### Count the nb of missing
+colname <- names(car_accidents)
+missing_val <- data.frame(colname) 
+missing_val <- missing_val %>% add_column(nbmiss = 0)
+
+for (col in 1:length(missing_val$colname)) {
+  missing_val[col, "nbmiss"] <- 100 * sum(is.na(car_accidents[colname[col]])) / nrow(car_accidents)
+}
+
+ggplot(missing_val) + geom_col(aes(y=colname, x=nbmiss)) + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  ggtitle("% of missing values in the dataset") + labs(x="Number of missing values", y="")
+```
+
+```{r}
+col_missing <- missing_val[missing_val["nbmiss"]>0, "colname"]
+summary(car_accidents[c(col_missing)])
+```
+
+```{r}
+### same with "" values
+colname <- names(car_accidents)
+empty_val <- data.frame(colname) 
+empty_val <- empty_val %>% add_column(nbempty = 10000)
+for (col in 1:nrow(empty_val)) {
+  if (sapply(car_accidents[colname[col]], class)[1]=="character") {
+    empty_val[col, "nbempty"] <- 100 * nrow(car_accidents[car_accidents[colname[col]]=="",]) / nrow(car_accidents) 
+  }else{
+    empty_val[col, "nbempty"] <- 0
+  }
+}
+ggplot(empty_val) + geom_col(aes(y=colname, x=nbempty)) + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  ggtitle("% of empty values in the dataset") + labs(x="% of missing values", y="")
+
+```
+
+```{r}
+### Remove columns with large number of missing values or not usefull for the analysis
+del_col <- c("End_Lat", "End_Lng", "End_Time", "Description", "Number", 
+             "Street", "Side", "Country", "Timezone", "Nautical_Twilight", "Wind_Chill.F.",
+             "Airport_Code", "Precipitation.in.", "Weather_Timestamp", "Astronomical_Twilight")
+
+car_accidents <- car_accidents[, !(names(car_accidents) %in% del_col)]
+```
+
+Remove rows with empty cells or missing values
+
+```{r}
+### Remove empty rows for Zipcode, City, Precipitation NAs
+car_accidents <- car_accidents %>% filter(City!="")
+car_accidents <- car_accidents %>% filter(!is.na(City))
+car_accidents <- car_accidents %>% filter(Zipcode!="")
+car_accidents$Zipcode <- sapply(strsplit(as.character(car_accidents$Zipcode), "-"), '[', 1)
+car_accidents <- car_accidents %>% filter(Weather_Condition!="")
+car_accidents <- car_accidents %>% filter(Sunrise_Sunset!="")
+car_accidents <- car_accidents %>% filter(Civil_Twilight!="")
+car_accidents <- car_accidents %>% filter(!is.na(Wind_Direction))
+car_accidents <- car_accidents %>% filter(!is.na(Temperature.F.))
+car_accidents <- car_accidents %>% filter(!is.na(Humidity...))
+car_accidents <- car_accidents %>% filter(!is.na(Pressure.in.))
+car_accidents <- car_accidents %>% filter(!is.na(Visibility.mi.))
+car_accidents <- car_accidents %>% filter(!is.na(Wind_Speed.mph.))
+```
+
+### Data Analysis
+
+### Spatial distribution
+
+```{r}
+## Spatial Distribution NY city: Which zipcode has the highest number of accidents?
+sf_car_accidents <- car_accidents %>% group_by(Zipcode) %>% count()
+sf_car_accidents <- rename(sf_car_accidents, "nb accidents" = "n")
+sf_car_accidents <- merge(sf_car_accidents, city_boundaries, 
+                          by.x="Zipcode", by.y="ZIPCODE", all.y=TRUE)
+sf_car_accidents[is.na(sf_car_accidents)] <- 0
+
+sf_car_accidents <- sf_car_accidents %>% st_as_sf()
+
+sf_nymap <- mapReport(sf_car_accidents, "nb accidents", 
+                      "Frequency of Accident \n in NYC")
+print(sf_nymap)
+```
+
+```{r}
+# distribution of accidents by borough
+borough <- car_accidents %>% group_by(County) %>% count()
+borough %>% arrange(desc(n))
+```
+
+```{r}
+## Spatial Distribution NY city: Which boroughs has the highest number of accidents?
+sf_car_accidents_severity <- car_accidents[,c("Zipcode", "Severity")] %>% group_by(Zipcode) %>% summarise(Severity = getmode(Severity))
+sf_car_accidents_severity <- merge(sf_car_accidents_severity, city_boundaries, 
+                          by.x="Zipcode", by.y="ZIPCODE", all.y = TRUE)
+
+sf_car_accidents_severity <- sf_car_accidents_severity %>% st_as_sf()
+
+sf_nymap <- mapReport(sf_car_accidents_severity, "Severity", 
+                      "Severity Distribution \n in NY City")
+print(sf_nymap)
+```
+
+### Analysis of distribution
+
+#### Global analysis
+
+```{r}
+## all numeric variable distribution
+car_accidents %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+  facet_wrap(~ key, scales = "free") +
+  geom_histogram()
+```
+
+```{r}
+## Create Geometry Points coordinates with lat and lng
+car_accidents_pts <- st_as_sf(car_accidents, coords = c("Start_Lat", "Start_Lng"))
+
+## 0. Time
+### Start_Time: "2016-02-08 00:37:08" /// End_Time:"2016-02-08 00:37:08"
+car_accidents$Start_Time <- ymd_hms(car_accidents$Start_Time)
+```
+
+#### Analysis of accidents severity
+
+```{r}
+## 1. Severity
+### Create the function to get the mode
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+mode_severity <- getmode(car_accidents$Severity)
+mode_severity
+ggplot(car_accidents, aes(Severity)) + geom_bar() + theme(plot.title = element_text(hjust = 0.5)) + ggtitle("Severity Distribution", ) + labs(x="Severity", y="Number of accidents")
+```
+
+#### Temporal distribution
+
+```{r}
+## Temporal evolution
+### hour plus accidents
+car_accidents$hour <- hour(car_accidents$Start_Time)
+mode_hour <- getmode(car_accidents$hour)
+mode_hour
+ggplot(car_accidents, aes(hour)) + geom_bar() + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  geom_vline(xintercept = mode_hour, colour = "red", show.legend = TRUE) + 
+  geom_vline(xintercept = mean(car_accidents$hour), colour = "green") + 
+  ggtitle("Number of accidents per hour") + 
+  labs(x="Hour", y="Number of accidents") 
+```
+
+More accidents occur during peak hour
+
+```{r}
+### day avec plus accidents
+car_accidents$day <- day(car_accidents$Start_Time)
+mode_day <- getmode(as.factor(car_accidents$day))
+mode_day
+ggplot(car_accidents, aes(as.factor(day))) + geom_bar() + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  geom_vline(xintercept = mode_day, colour = "red") + 
+  ggtitle("Number of accidents per day") + labs(x="Day", y="Number of accidents")
+```
+
+The 12th of the month is the day with the biggest number of accidents
+
+```{r}
+### month avec plus accidents
+car_accidents$month <- month(car_accidents$Start_Time)
+mode_month <- getmode(as.factor(car_accidents$month))
+mode_month
+ggplot(car_accidents, aes(as.factor(month))) + geom_bar() + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  geom_vline(xintercept = mode_month, colour = "red") + 
+  ggtitle("Number of accidents per month") + labs(x="Month", y="Number of accidents")
+```
+
+December is the month with the most accidents over the past 5 years
+
+```{r}
+### repartition des releves par mois
+nbmonths <- car_accidents %>% group_by(month) %>% count()
+minYear <- min(car_accidents_import$Start_Time)
+maxYear <- max(car_accidents_import$Start_Time)
+ggplot(nbmonths, aes(x=month, y=n)) + geom_line() + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  ggtitle("Number of accidents per month") + labs(x="Month", y="Number of accidents")
+```
+
+```{r}
+### year avec plus accidents
+car_accidents$year <- year(car_accidents$Start_Time)
+mode_y <- getmode(as.factor(car_accidents$year))
+mode_y
+ggplot(car_accidents, aes(as.factor(year))) + geom_bar() + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  geom_vline(xintercept = mode_y, colour = "red") + 
+  ggtitle("Number of accidents per year") + labs(x="Year", y="Number of accidents")
+```
+
+It seams that more car accidents have been recorded in 2021 and not that more accidents occured in 2021
+
+```{r}
+### repartition des releves par mois
+nb_y <- car_accidents %>% group_by(year) %>% count()
+ggplot(nb_y, aes(x=year, y=n)) + geom_line() + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  ggtitle("Number of accidents per year") + labs(x="Year", y="Number of accidents")
+```
+
+#### Comparison of accidents per cities
+
+```{r}
+## Cities : List the top 20 Cities with highest accident rates an find which city has maximum number of accidents
+nb_cities <- length(unique(car_accidents$City))
+#city_name <- car_accidents_import[car_accidents_import$City=="",]
+top20_cities <- car_accidents %>% group_by(City) %>% count()
+top20_cities <- top20_cities %>% arrange(desc(n))
+n <- nrow(top20_cities)
+top20_cities <- top20_cities[1:20,]
+ggplot(top20_cities, aes(x=n, y=City)) + geom_col() + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  ggtitle("Number of accidents per city") + labs(y="City", x="Number of accidents")
+```
+
+#### Impact of the weather
+
+Impact of Humidity
+
+```{r}
+### Humidity(%)	Shows the humidity (in percentage).
+humidit_pct <- car_accidents %>% group_by(Humidity...) %>% count()
+humidit_pct <- humidit_pct %>% arrange(desc(n))
+humidit_pct <- humidit_pct[1:20,]
+humidit_pct$Humidity... <- as.factor(humidit_pct$Humidity...)
+ggplot(humidit_pct, aes(x=n, y=Humidity...)) + geom_col() + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  ggtitle("Number of accidents per % of Humidity") + 
+  labs(y="Level of Humidity", x="Number of accidents")
+```
+
+Impact of weather conditions
+
+```{r}
+### Types of weather conditions
+typeweather <- car_accidents %>% group_by(Weather_Condition) %>% count()
+typeweather <- typeweather %>% arrange(desc(n))
+typeweather <- typeweather[1:20,]
+ggplot(typeweather, aes(x=n, y=Weather_Condition)) + geom_col() + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  ggtitle("Number of accidents per type of Weather") + 
+  labs(y="Weather Condition", x="Number of accidents")
+```
+
+Impact of sunrise/sunset variable
+
+```{r}
+### Sunrise_Sunset
+# On What part of day(Day/Night) maximum number of accidents occured?
+sunrise_set <- car_accidents %>% group_by(Sunrise_Sunset) %>% count()
+sunrise_set <- sunrise_set %>% arrange(desc(n))
+ggplot(sunrise_set, aes(x=n, y=Sunrise_Sunset)) + geom_col() + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  ggtitle("Number of accidents during the day") + 
+  labs(y="Day or Night", x="Number of accidents")
+```
+
+### Correlation analysis
+
+```{r }
+# Correlation matrix
+library("corrplot")
+col_num <- c()
+for (col in colnames(car_accidents)) {
+  if (sapply(car_accidents[col], class)[1]=="numeric" | sapply(car_accidents[col], class)[1]=="integer"){
+    col_num <- append(col_num, col)
+  }
+}
+col_num <- col_num[col_num %in% c("Start_Lat", "Start_Lng") == FALSE] 
+sub_car_accidents <- subset(car_accidents, select=col_num)
+correlation <- cor(sub_car_accidents, use = "complete.obs")
+
+corrplot(correlation, type = "upper", order = "hclust", tl.col = "black", tl.srt = 45)
+```
+
+### Data Engineering
+
+```{r }
+## features selection
+# Remove the features not impacted by the time (ie characteristic of the roads for example)
+del_col2 <- c("Amenity", "Bump", "Crossing", "Give_Way", "Junction", "No_Exit" ,
+              "Railway", "Roundabout", "Station", "Stop", "Traffic_Calming",
+              "Traffic_Signal", "Turning_Loop")
+
+car_accidents <- car_accidents[, !(names(car_accidents) %in% del_col2)]
+# so we keep weather and time related features
+```
+
+```{r }
+# Features classification
+weather <- c("Weather_Timestamp", "Temperature.F.", "Wind_Chill.F.", "Humidity...", 
+             "Pressure.in.", "Visibility.mi.", "Wind_Direction", "Wind_Speed.mph.", "Weather_Condition")
+
+time <- c("Sunrise_Sunset", "Civil_Twilight", "Astronomical_Twilight", "hour",
+          "day", "month", "year")
+
+xs_num <- car_accidents[, c("Temperature.F.", "Humidity...", 
+                            "Pressure.in.", "Visibility.mi.", "Wind_Speed.mph.")]
+
+```
+
+```{r}
+## Normalization data
+xs_num <- scale(xs_num)
+head(xs_num)
+```
+
+### Spatio-Temporal Analysis
+
+#### Spatial heterogeneity
+
+```{r }
+## Spatial heterogeneity
+library(spData)
+library(spdep)
+
+## removing Staten Island data as it is to far from the other boroughs
+statenisland <- c("10301", "10302", "10303", "10304", "10305", "10306", "10307", "10308",
+                  "10309", "10310", "10311", "10312", "10313", "10314")
+sf_car_accidents2 <- sf_car_accidents[!(sf_car_accidents$Zipcode %in% statenisland),]
+```
+
+```{r}
+## step 1: Define neighboring polygons (contiguous polygons that share at least one vertex)
+#nb <- poly2nb(sf_car_accidents2$geometry, queen=TRUE)
+pts <- st_centroid(sf_car_accidents2$geometry)
+nb <- dnearneigh(pts, 0, 100000)
+```
+
+```{r}
+### Step 2: Assign weights to the neighbors (based on distance)
+la_weights <- nb2listwdist(nb, style="W", as(pts, "Spatial"), type="idw", alpha = 1, zero.policy=TRUE)
+la_weights$weights[1] # same weights for each neighboring polygon
+```
+
+```{r}
+### Step 3: (optional): Compute the (weighted) neighbor mean LE values (spatially lagged value)
+nb.lag <- lag.listw(la_weights, sf_car_accidents2$`nb accidents`)
+nb.lag
+
+plot(nb.lag ~ sf_car_accidents2$`nb accidents`, pch=16, asp=1)
+M1 <- lm(nb.lag ~ sf_car_accidents2$`nb accidents`)
+abline(M1, col="blue")
+
+
+coef(M1)[2]
+```
+
+```{r}
+# Step 4: Computing the Moran’s I statistic
+# the Moran’s I value is the slope of the line that best fits the relationship between neighboring income values and each polygon’s income in the dataset
+coor <- st_centroid(sf_car_accidents2$geometry) 
+cartePPV3.knn <- knearneigh(coor, k=3) 
+cartePPV3.nb <- knn2nb(cartePPV3.knn)
+PPV3.w <- nb2listw(cartePPV3.nb, style="W")
+
+I <- moran(sf_car_accidents2$`nb accidents`, la_weights, length(nb), Szero(la_weights))[1]
+I
+```
+
+```{r}
+# Step 5: Performing a hypothesis test
+# hyp0: the nb accidents values are randomly distributed across NYC following a completely random process
+stat = moran.test(sf_car_accidents2$`nb accidents`, la_weights, alternative="greater")
+stat
+```
+
+```{r}
+# Step 6: MC test of Moran's I
+MC<- moran.mc(sf_car_accidents2$`nb accidents`, la_weights, nsim=999, alternative="greater")  # 999 simulation MC
+MC$p.value  # 0.001
+```
+
+```{r}
+# Step 7: Local Moran's I
+local <- localmoran(sf_car_accidents2$`nb accidents`, la_weights)
+Ii <- localmoran(sf_car_accidents2$`nb accidents`, la_weights)
+sf_car_accidents2$Ii <- Ii[,"Ii"]
+tm_shape(sf_car_accidents2) + tm_polygons(col="Ii", palette="-RdBu", style="quantile")
+```
+
+```{r}
+# binds results to shapefile
+moran.map <- cbind(sf_car_accidents2, local)
+tm_shape(moran.map) +
+  tm_fill(col = "Ii",
+          style = "quantile",
+          title = "local moran statistic")
+```
+
+```{r}
+# binds results to our polygon shapefile
+moran.map <- cbind(sf_car_accidents2, local)
+tm_shape(moran.map) +
+  tm_fill(col = "Ii",
+          style = "quantile",
+          title = "local moran statistic")
+
+localmoran_map <- mapReport(moran.map, "Ii", "Local Moran's I Statistic", style="jenks")
+print(localmoran_map)
+# high positive mean high/high or low/low vs negative mean high/low or low/high
+# high value neighboring high value (high/high)
+moran.plot(sf_car_accidents2$`nb accidents`, la_weights, labels=sf_car_accidents2$City)
+```
+
+#### Spatial autocorrelation analysis for categorical variables
+
+```{r}
+## JoinCount: Spatial autocorrelation analysis for categorical variables (ie Severity)
+# Neighbours list and spatial weight matrices
+car_accidents_pts_jc <- car_accidents[,c("Severity", "Start_Lat", "Start_Lng")]
+car_accidents_pts_unique <- car_accidents_pts_jc %>% group_by(Start_Lat, Start_Lng) %>% summarise(Severity = getmode(Severity))
+car_accidents_pts_unique <- st_as_sf(car_accidents_pts_unique, coords = c("Start_Lat", "Start_Lng"))
+Severity <- as.factor(car_accidents_pts_unique$Severity)
+car_accidents_pts.nb <- knn2nb(knearneigh(car_accidents_pts_unique, k=2))
+
+# Implementation of the test
+joincount.multi(Severity, listw2U(nb2listw(car_accidents_pts.nb)))
+
+# Monte Carlo Joincount
+joincount.mc(Severity, listw2U(nb2listw(car_accidents_pts.nb)), nsim = 1000)
+```
+
+```{r}
+## Time Autocorrelation of Severity 
+acf(car_accidents$Severity)
+pacf(car_accidents$Severity)
+```
+
+#### Space-time semivariogram
+
+```{r}
+## Spatio-temporal analysis: space-time semivariogram to measure of spatiotemporal correlation
+car_accidents <- car_accidents[order(car_accidents$Start_Time),]
+
+# Years are converted to date format
+library("spacetime")
+library(tidyr)
+library(dplyr)
+library(readr)
+library(sf)
+library(gstat)
+sta_car_accidents <- car_accidents_pts
+sta_car_accidents$Start_Time <- as.Date(car_accidents_pts$Start_Time)
+sta_car_accidents <- sta_car_accidents[,c("Severity", "Start_Time", "geometry")]
+
+time <- as.Date(sta_car_accidents$Start_Time)
+time <- time[order(time)]
+
+# Project the points to get spatial lags in metres
+pts_df <- car_accidents[,c('Start_Lat', 'Start_Lng')]
+pts <- SpatialPoints(pts_df,
+                     proj4string=CRS("+init=epsg:4326 +proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs +towgs84=0,0,0"))
+
+sta_car_accidents$name <- as.factor(as.character(sta_car_accidents$geometry))
+index <- data.matrix(st_drop_geometry(sta_car_accidents[,c("Start_Time", "name")]))
+datapivot <- st_drop_geometry(sta_car_accidents)
+
+stsdf <- STSDF(pts, time,  datapivot, index = index)
+names(stsdf@data) <- "Severity"
+
+
+# ref https://www.rdocumentation.org/packages/gstat/versions/2.1-0/topics/variogramST
+# ref: https://moodle.ucl.ac.uk/pluginfile.php/5897103/mod_resource/content/18/_book/spatio-temporal-dependence-and-autocorrelation.html
+#ChSTVar <- variogram(Severity~1, stsdf, width=100, cutoff=1000,tlags=0:10)
+plot(ChSTVar)
+plot(ChSTVar, wireframe=T)
+```
+
+## Modeling
+
+```{r }
+# Modelling
+library(caret)
+library(plyr)
+
+## Data Prep
+### time
+car_accidents$Start_Time <- as.Date(car_accidents$Start_Time)
+```
+
+### Undersampling data
+
+```{r}
+### Undersample the majority class // ref: https://topepo.github.io/caret/index.html
+car_accidents$Severity <- cut(car_accidents$Severity, breaks=c(0,2,5), labels=c(0, 1))
+table(car_accidents$Severity)
+car_accidents$Severity <- revalue(car_accidents$Severity, c("0"="light", "1"="severe"))
+res_car_accidents <- downSample(x = car_accidents[, c(1, 3, 4, 5, 6, 11:19)], y = as.factor(car_accidents$Severity), yname="Severity_bin")
+table(res_car_accidents$Severity_bin) 
+```
+
+### Split Train/Test the data
+
+```{# Data sets:}
+Xs_con <- scale(res_car_accidents[, c("Temperature.F.", "Humidity...",  "Pressure.in.", 
+                                  "Visibility.mi.", "Wind_Speed.mph.")])
+Xs_con[is.na(Xs_con)] <- 0
+Xs_dis <- res_car_accidents[, c("Wind_Direction", "Weather_Condition", "Sunrise_Sunset", "Civil_Twilight")]
+Xs_dis[is.na(Xs_dis)] <- 0
+# convert to factors
+Xs_dis$Wind_Direction <- as.factor(Xs_dis$Wind_Direction)
+Xs_dis$Weather_Condition <- as.factor(Xs_dis$Weather_Condition)
+Xs_dis$Sunrise_Sunset <- as.factor(Xs_dis$Sunrise_Sunset)
+Xs_dis$Civil_Twilight <- as.factor(Xs_dis$Civil_Twilight)
+
+# All predictors
+Xs_all <- cbind(res_car_accidents$ID, res_car_accidents$Start_Lat, res_car_accidents$Start_Lng, Xs_con, Xs_dis)
+
+# Target:
+Ys <- res_car_accidents$Severity_bin
+table(Ys) 
+
+# Train / Test sets
+set.seed(25)
+n <- nrow(Xs_con)
+trainInd <- sort(sample(1:nrow(Xs_con), n*0.85)) # 85% for the train set
+Xs_con_Train <- data.frame(Xs_con[trainInd,])
+length(Xs_con_Train$Temperature.F.)
+Xs_con_Test <- data.frame(Xs_con[-trainInd,])
+length(Xs_con_Test$Temperature.F.)
+
+Xs_all_Train <- Xs_all[trainInd,]
+length(Xs_all_Train$Temperature.F.)
+Xs_all_Test <- Xs_all[-trainInd,]
+length(Xs_all_Test$Temperature.F.)
+
+Ys_Train <- Ys[trainInd]
+length(Ys_Train)
+Ys_Test <- Ys[-trainInd] 
+length(Ys_Test)
+
+# Check for missing values in sets
+sum(is.na(Ys_Train))
+```
+
+### AdaBoost Model
+
+```{r }
+# ADABOOST
+# Train the model // ref: https://cran.r-project.org/web/packages/ada/ada.pdf // https://rdrr.io/cran/MachineShop/man/AdaBoostModel.html
+library(ada)
+boost.ada <- ada(Ys_Train~., data=data.frame(cbind(Xs_con_Train, Ys_Train)), test.x=data.matrix(Xs_con_Test), test.y=Ys_Test, 
+                 loss="exponential", type="discrete",
+                 iter=350, control = rpart.control(maxdepth=1,cp=-1,minsplit=0,xval=0))
+plot(boost.ada, kappa=F, test=T, tflag=F)
+boost.ada$confusion
+boost.ada$model$errs[,3]
+summary(boost.ada) # 
+# plot error
+plot(boost.ada, test=T)
+boost.ada$model$errs[,3]
+
+pred_ada <- predict(boost.ada, newdata = Xs_con_Test, type='vector')
+confusionMatrix(pred_ada, Ys_Test)
+
+training_set <- cbind(data.frame(Xs_con_Train), Ys_Train)
+seeds <- vector(mode = "list", length = nrow(Xs_con_Train) + 1)
+seeds <- lapply(seeds, function(x) 1:20)
+cctrl1 <- trainControl(method = "cv", number = 7, returnResamp = "all",
+                       classProbs = TRUE,
+                       seeds = seeds)
+grid <- expand.grid(mfinal = (1:3)*3, 
+                    maxdepth = c(1, 3, 5, 7),
+                    coeflearn = c("Breiman", "Freund", "Zhu"))
+model1adaboost <- train(y=Ys_Train, x=data.frame(Xs_con_Train),# data = training_set,
+                method="AdaBoost.M1",
+                trControl = cctrl1,
+                tuneGrid = grid,
+                metric = "Accuracy", 
+                preProc = c("center", "scale"))
+model1adaboost # The final values used for the model were mfinal = 9, maxdepth = 3 and coeflearn = Freund.
+
+predict_adam1 <- predict(model1adaboost, newdata = Xs_con_Test)
+cfmatM1 <- confusionMatrix(predict_adam1, Ys_Test)
+cfmatM1$table
+
+
+```
+
+### Random Forest Model
+
+```{r}
+# Random Forest // ref: https://cran.r-project.org/web/packages/randomForest/randomForest.pdf
+library(caret) # ref: https://topepo.github.io/caret/
+training_set <- cbind(data.frame(Xs_all_Train), Ys_Train)
+```
+
+#### First Model
+
+```{r}
+# 1st rf model
+model1 <- train(y=Ys_Train, x=data.frame(Xs_con_Train),# data = training_set,
+                method="rf", 
+                tuneGrid = data.frame("mtry"=2),
+                importance = TRUE,ntree=50,
+                trControl = trainControl(method="cv", number=10, classProbs = TRUE))
+model1  # 0.7054316
+predict_model1 <- predict(model1, newdata = Xs_con_Test)
+cfmatM1 <- confusionMatrix(predict_model1, Ys_Test) # 0.7177   
+cfmatM1$table
+```
+
+#### Second Model
+
+```{r}
+# 2nd rf model: Target-oriented validation 
+library(CAST) # ref: https://github.com/HannaMeyer/Geostat2018/blob/master/practice/CAST-intro.Rmd
+set.seed(25)
+indices <- CreateSpacetimeFolds(training_set, 
+                                spacevar = "res_car_accidents.ID",
+                                k=3)
+model_LLO <- train(y=Ys_Train, x=data.frame(Xs_con_Train),
+                   method="rf",
+                   tuneGrid=data.frame("mtry"=2), 
+                   importance=TRUE,
+                   trControl=trainControl(method="cv",
+                                          index = indices$index))
+model_LLO #0.6845033
+plot(varImp(model_LLO))
+predict_model_LLO <- predict(model_LLO, newdata = Xs_con_Test)
+cfmatM1 <- confusionMatrix(predict_model_LLO, Ys_Test) # 0.7364    
+cfmatM1$table
+```
+
+#### Third Model
+
+```{r}
+# 3nd rf model: Target-oriented validation +. Add Lat Lon features
+library(CAST)
+set.seed(25)
+indices <- CreateSpacetimeFolds(training_set, 
+                                spacevar = "res_car_accidents.ID",
+                                k=10)
+model_LLO2 <- train(y=Ys_Train, x=data.frame(Xs_all_Train[, 2:12]),
+                   method="rf",
+                   tuneGrid=data.frame("mtry"=2), 
+                   importance=TRUE,
+                   trControl=trainControl(method="cv",
+                                          index = indices$index))
+model_LLO2 # 0.7271114
+plot(varImp(model_LLO2))
+predict_model_LLO2 <- predict(model_LLO2, newdata = data.frame(Xs_all_Test[, 2:12]))
+cfmatM1 <- confusionMatrix(predict_model_LLO2, Ys_Test) # 0.7644  
+cfmatM1$table
+```
+
+#### Fourth Model
+
+```{r }
+# 4rd rf model: Vb selection  // ref: https://rdrr.io/cran/CAST/man/ffs.html
+library(CAST)
+set.seed(25)
+model_LLO3 <- ffs(data.frame(Xs_all_Train[, 4:12]), Ys_Train, 
+                  method="rf", 
+                  tuneGrid=data.frame("mtry"=2),
+                  verbose=FALSE,
+                  ntree=50,
+                  trControl=trainControl(method="cv",
+                                         index = indices$index))
+model_LLO3 # 0.6715696
+
+plot(varImp(model_LLO3))
+plot_ffs(model_LLO3)
+predict_model_LLO3 <- predict(model_LLO3, newdata = Xs_all_Test)
+cfmatM1 <- confusionMatrix(predict_model_LLO3, Ys_Test) # : 0.7457
+cfmatM1$table
+```
+
+### ST DBSCAN
+
+```{r }
+# ST DBSCAN  // Not successful Classification
+# ref: https://github.com/CKerouanton/ST-DBSCAN
+source("stdbscan.R")
+library("lubridate")
+class <- stdbscan(x=res_car_accidents$Start_Lng, y=res_car_accidents$Start_Lat, time=as.Date(res_car_accidents$Start_Time),
+         eps = 1000, eps2 = 100, minpts = 3, cldensity = TRUE) 
+table(class$cluster)
+class$cluster
+class$density
+```
